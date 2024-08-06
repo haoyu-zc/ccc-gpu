@@ -1,24 +1,22 @@
 """
-Contains function that implement the Clustermatch Correlation Coefficient (CCC).
+This module contains the CUDA implementation of the CCC
 """
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable, Union
+import math
+from typing import Iterable, Union, List, Tuple
 
 import numpy as np
+import cupy
 from numpy.typing import NDArray
 from numba import njit
-from numba.typed import List
+from numba import cuda
 
 from ccc.pytorch.core import unravel_index_2d
-from ccc.sklearn.metrics import adjusted_rand_index as ari
-# from ccc.sklearn.metrics_gpu import adjusted_rand_index as ari
 from ccc.scipy.stats import rank
-from ccc.utils import chunker
 
 
 @njit(cache=True, nogil=True)
-def get_perc_from_k(k: int) -> list[float]:
+def get_perc_from_k(k: int) -> np.ndarray:
     """
     It returns the percentiles (from 0.0 to 1.0) that separate the data into k
     clusters. For example, if k=2, it returns [0.5]; if k=4, it returns [0.25,
@@ -29,9 +27,53 @@ def get_perc_from_k(k: int) -> list[float]:
             list.
 
     Returns:
-        A list of percentiles (from 0.0 to 1.0).
+        A numpy array of percentiles (from 0.0 to 1.0).
     """
-    return [(1.0 / k) * i for i in range(1, k)]
+    if k < 2:
+        return np.empty(0, dtype=np.float32)
+    return np.array([(1.0 / k) * i for i in range(1, k)], dtype=np.float32)
+
+
+# @njit(cache=True, nogil=True)
+def get_range_n_percs(ks: List[int]) -> List[List[float]]:
+    """
+    It returns lists of the percentiles (from 0.0 to 1.0) that separate the data into k[i] clusters
+    
+    Args:
+        ks: list of numbers of clusters.
+    
+    Returns:
+        A list of lists of percentiles (from 0.0 to 1.0).
+    """
+    # Todo: research on if numba can optimize this
+    percentiles: List[List[float]] = []
+    for k in ks:
+        perc = get_perc_from_k(k)
+        percentiles.append(perc)
+    return percentiles
+
+
+def get_feature_type_and_encode(feature_data: NDArray) -> tuple[NDArray, bool]:
+    """
+    Given the data of one feature as a 1d numpy array (it could also be a pandas.Series),
+    it returns the same data if it is numerical (float, signed or unsigned integer) or an
+    encoded version if it is categorical (each category value has a unique integer starting from
+    zero).` f
+
+    Args:
+        feature_data: a 1d array with data.
+
+    Returns:
+        A tuple with two elements:
+          1. the feature data: same as input if numerical, encoded version if not numerical.
+          2. A boolean indicating whether the feature data is numerical or not.
+    """
+    data_type_is_numerical = feature_data.dtype.kind in ("f", "i", "u")
+    if data_type_is_numerical:
+        return feature_data, data_type_is_numerical
+
+    # here np.unique with return_inverse encodes categorical values into numerical ones
+    return np.unique(feature_data, return_inverse=True)[1], data_type_is_numerical
 
 
 @njit(cache=True, nogil=True)
@@ -74,16 +116,16 @@ def run_quantile_clustering(data: NDArray, k: int) -> NDArray[np.int16]:
 
 @njit(cache=True, nogil=True)
 def get_range_n_clusters(
-    n_features: int, internal_n_clusters: Iterable[int] = None
+        n_items: int, internal_n_clusters: Iterable[int] = None
 ) -> NDArray[np.uint8]:
     """
     Given the number of features it returns a tuple of k values to cluster those
     features into. By default, it generates a tuple of k values from 2 to
-    int(np.round(np.sqrt(n_features))) (inclusive). For example, for 25 features,
+    int(np.round(np.sqrt(n_items))) (inclusive). For example, for 25 features,
     it will generate this tuple: (2, 3, 4, 5).
 
     Args:
-        n_features: a positive number representing the number of features that
+        n_items: a positive number representing the number of features that
             will be clustered into different groups/clusters.
         internal_n_clusters: it allows to force a different list of clusters. It
             must be a list of integers. Repeated or invalid values will be dropped,
@@ -96,12 +138,12 @@ def get_range_n_clusters(
     if internal_n_clusters is not None:
         # remove k values that are invalid
         clusters_range_list = list(
-            set([int(x) for x in internal_n_clusters if 1 < x < n_features])
+            set([int(x) for x in internal_n_clusters if 1 < x < n_items])
         )
     else:
         # default behavior if no internal_n_clusters is given: return range from
-        # 2 to sqrt(n_features)
-        n_sqrt = int(np.round(np.sqrt(n_features)))
+        # 2 to sqrt(n_items)
+        n_sqrt = int(np.round(np.sqrt(n_items)))
         n_sqrt = min((n_sqrt, 10))
         clusters_range_list = list(range(2, n_sqrt + 1))
 
@@ -110,7 +152,7 @@ def get_range_n_clusters(
 
 @njit(cache=True, nogil=True)
 def get_parts(
-    data: NDArray, range_n_clusters: tuple[int], data_is_numerical: bool = True
+        data: NDArray, range_n_clusters: tuple[int], data_is_numerical: bool = True
 ) -> NDArray[np.int16]:
     """
     Given a 1d data array, it computes a partition for each k value in the given
@@ -134,8 +176,11 @@ def get_parts(
         detected (partitions with one cluster), usually because of problems with the
         input data (it has all the same values, for example).
     """
+    # parts[i] represents the partition for cluster i
+    # parts[i][j] represents the cluster assignment for element j, using i-th cluster's configuration
     parts = np.zeros((len(range_n_clusters), data.shape[0]), dtype=np.int16) - 1
 
+    # can use cupy.digitize here
     if data_is_numerical:
         for idx in range(len(range_n_clusters)):
             k = range_n_clusters[idx]
@@ -150,70 +195,6 @@ def get_parts(
         parts[0] = data.astype(np.int16)
 
     return parts
-
-
-def cdist_parts_basic(x: NDArray, y: NDArray) -> NDArray[float]:
-    """
-    It implements the same functionality in scipy.spatial.distance.cdist but
-    for clustering partitions, and instead of a distance it returns the adjusted
-    Rand index (ARI). In other words, it mimics this function call:
-
-        cdist(x, y, metric=ari)
-
-    Only partitions with positive labels (> 0) are compared. This means that
-    partitions marked as "singleton" or "empty" (categorical data) are not
-    compared. This has the effect of leaving an ARI of 0.0 (zero).
-
-    Args:
-        x: a 2d array with m_x clustering partitions in rows and n objects in
-          columns.
-        y: a 2d array with m_y clustering partitions in rows and n objects in
-          columns.
-
-    Returns:
-        A 2d array with m_x rows and m_y columns and the ARI between each
-        partition pair. Each ij entry is equal to ari(x[i], y[j]) for each i
-        and j.
-    """
-    res = np.zeros((x.shape[0], y.shape[0]))
-
-    for i in range(res.shape[0]):
-        if x[i, 0] < 0:
-            continue
-
-        for j in range(res.shape[1]):
-            if y[j, 0] < 0:
-                continue
-
-            res[i, j] = ari(x[i], y[j])
-
-    return res
-
-
-def cdist_parts_parallel(
-    x: NDArray, y: NDArray, executor: ThreadPoolExecutor
-) -> NDArray[float]:
-    """
-    It parallelizes cdist_parts_basic function.
-
-    Args:
-        x: same as in cdist_parts_basic
-        y: same as in cdist_parts_basic
-        executor: an pool executor where jobs will be submitted.
-
-    Results:
-        Same as in cdist_parts_basic.
-    """
-    res = np.zeros((x.shape[0], y.shape[0]))
-
-    inputs = list(chunker(np.arange(res.shape[0]), 1))
-
-    tasks = {executor.submit(cdist_parts_basic, x[idxs], y): idxs for idxs in inputs}
-    for t in as_completed(tasks):
-        idx = tasks[t]
-        res[idx, :] = t.result()
-
-    return res
 
 
 @njit(cache=True, nogil=True)
@@ -235,84 +216,49 @@ def get_coords_from_index(n_obj: int, idx: int) -> tuple[int]:
         equivalent to the condensed array.
     """
     b = 1 - 2 * n_obj
-    x = np.floor((-b - np.sqrt(b**2 - 8 * idx)) / 2)
+    x = np.floor((-b - np.sqrt(b ** 2 - 8 * idx)) / 2)
     y = idx + x * (b + x + 2) / 2 + 1
     return int(x), int(y)
 
 
-def get_chunks(
-    iterable: Union[int, Iterable], n_threads: int, ratio: float = 1
-) -> Iterable[Iterable[int]]:
+@cuda.jit(device=True)
+def get_parts(
+        data: NDArray, res: NDArray[np.int16], ange_n_clusters: tuple[int], data_is_numerical: bool = True):
+    return
+
+
+# store result to device global memory
+@cuda.jit
+def compute_parts(X: np.ndarray, parts: np.ndarray, n_range_cluster: NDArray[np.uint8]):
+    x, y, z = cuda.grid(3)
+    if x < parts.shape[0] and y < parts.shape[1] and z < parts.shape[2]:
+        parts[x, y, z] += 1
+    return
+
+
+@cuda.jit
+def compute_parts2(parts: np.ndarray):
+    x, y = cuda.grid(2)
+    if x < parts.shape[0] and y < parts.shape[1]:
+       parts[x, y] += 1
+    return
+
+
+# Opt: may lower uint16 to reduce memory consumption and data movement
+def bin_objects(objs: NDArray[np.uint16], n_clusters: int) -> NDArray[np.uint16]:
     """
-    It splits elements in an iterable in chunks according to the number of
-    CPU cores available for parallel processing.
-
-    Args:
-        iterable: an iterable to be split in chunks. If it is an integer, it
-            will split the iterable given by np.arange(iterable).
-        n_threads: number of threads available for parallelization.
-        ratio: a ratio that allows to increase the number of splits given
-            n_threads. For example, with ratio=1, the function will just split
-            the iterable in n_threads chunks. If ratio is larger than 1, then
-            it will split in n_threads * ratio chunks.
-
-    Results:
-        Another iterable with chunks according to the arguments given. For
-        example, if iterable is [0, 1, 2, 3, 4, 5] and n_threads is 2, it will
-        return [[0, 1, 2], [3, 4, 5]].
+    This function is a CUDA kernel for binning (digitizing) objects according to the percentiles provided
     """
-    if isinstance(iterable, int):
-        iterable = np.arange(iterable)
-
-    n = len(iterable)
-    expected_n_chunks = n_threads * ratio
-
-    res = list(chunker(iterable, int(np.ceil(n / expected_n_chunks))))
-
-    while len(res) < expected_n_chunks <= n:
-        # look for an element in res that can be split in two
-        idx = 0
-        while len(res[idx]) == 1:
-            idx = idx + 1
-        # Got two chunks
-        new_chunk = get_chunks(res[idx], 2)
-        res[idx] = new_chunk[0]
-        # Insert the second chunk in the next position
-        res.insert(idx + 1, new_chunk[1])
-
-    return res
-
-
-def get_feature_type_and_encode(feature_data: NDArray) -> tuple[NDArray, bool]:
-    """
-    Given the data of one feature as a 1d numpy array (it could also be a pandas.Series),
-    it returns the same data if it is numerical (float, signed or unsigned integer) or an
-    encoded version if it is categorical (each category value has a unique integer starting from
-    zero).
-
-    Args:
-        feature_data: a 1d array with data.
-
-    Returns:
-        A tuple with two elements:
-          1. the feature data: same as input if numerical, encoded version if not numerical.
-          2. A boolean indicating whether the feature data is numerical or not.
-    """
-    data_type_is_numerical = feature_data.dtype.kind in ("f", "i", "u")
-    if data_type_is_numerical:
-        return feature_data, data_type_is_numerical
-
-    # here np.unique with return_inverse encodes categorical values into numerical ones
-    return np.unique(feature_data, return_inverse=True)[1], data_type_is_numerical
+    raise NotImplementedError
 
 
 def ccc(
-    x: NDArray,
-    y: NDArray = None,
-    internal_n_clusters: Union[int, Iterable[int]] = None,
-    return_parts: bool = False,
-    n_chunks_threads_ratio: int = 1,
-    n_jobs: int = 1,
+        x: NDArray,
+        y: NDArray = None,
+        internal_n_clusters: Union[int, Iterable[int]] = None,
+        return_parts: bool = False,
+        n_chunks_threads_ratio: int = 1,
+        n_jobs: int = 1,
 ) -> tuple[NDArray[float], NDArray[np.uint64], NDArray[np.int16]]:
     """
     This is the main function that computes the Clustermatch Correlation
@@ -381,10 +327,11 @@ def ccc(
     X_numerical_type = None
     if x.ndim == 1 and (y is not None and y.ndim == 1):
         # both x and y are 1d arrays
-        assert x.shape == y.shape, "x and y need to be of the same size"
+        if not x.shape == y.shape:
+            raise ValueError("x and y need to be of the same size")
         n_objects = x.shape[0]
         n_features = 2
-
+        # Create a matrix to store both x and y
         X = np.zeros((n_features, n_objects))
         X_numerical_type = np.full((n_features,), True, dtype=bool)
 
@@ -423,13 +370,9 @@ def ccc(
     else:
         raise ValueError("Wrong combination of parameters x and y")
 
-    # get number of cores to use
-    n_jobs = os.cpu_count() if n_jobs is None else n_jobs
-    default_n_threads = (os.cpu_count() - n_jobs) if n_jobs < 0 else n_jobs
-
     # Converts internal_n_clusters to a list of integers if it's provided.
     if internal_n_clusters is not None:
-        _tmp_list = List()
+        _tmp_list = List[int]
 
         if isinstance(internal_n_clusters, int):
             # this interprets internal_n_clusters as the maximum k
@@ -439,16 +382,19 @@ def ccc(
             _tmp_list.append(x)
         internal_n_clusters = _tmp_list
 
-    # get matrix of partitions for each object pair
+    # Get matrix of partitions for each object pair
     range_n_clusters = get_range_n_clusters(n_objects, internal_n_clusters)
 
     if range_n_clusters.shape[0] == 0:
         raise ValueError(f"Data has too few objects: {n_objects}")
 
-    # store a set of partitions per row (object) in X as a multidimensional
-    # array, where the second dimension is the number of partitions per object.
+    # Store a set of partitions per row (object) in X as a multidimensional array, where the second dimension is the
+    # number of partitions per object.
+    # The value at parts[i, j, k] will represent the cluster assignment for the k-th object, using the j-th cluster
+    # configuration, for the i-th feature.
+    # Allocate this directly on the GPU
     parts = (
-        np.zeros((n_features, range_n_clusters.shape[0], n_objects), dtype=np.int16) - 1
+            np.zeros((n_features, range_n_clusters.shape[0], n_objects), dtype=np.int16) - 1
     )
 
     # cm_values stores the CCC coefficients
@@ -459,104 +405,103 @@ def ccc(
     # partitions that maximimized the ARI
     max_parts = np.zeros((n_features_comp, 2), dtype=np.uint64)
 
-    with ThreadPoolExecutor(max_workers=default_n_threads) as executor:
-        # pre-compute the internal partitions for each object in parallel
-        inputs = get_chunks(n_features, default_n_threads, n_chunks_threads_ratio)
+    # X here (and following) is a numpy array features are in rows, objects are in columns
 
-        def compute_parts(idxs: List[int]) -> np.ndarray:
-            return np.array(
-                [get_parts(X[i], range_n_clusters, X_numerical_type[i]) for i in idxs]
-            )
+    # Notes for CUDA dim: for genetic data, number of features is usually small, so we can use a 1D grid?
+    # but number of objects is usually large.
 
-        for idx, ps in zip(inputs, executor.map(compute_parts, inputs)):
-            # numpy arrays can be indexed by another numpy array, idx here is actually a numpy array
-            parts[idx] = ps
+    # cuda.synchronize()
+    # For this iteration, we use 1D block and 2D grid
+    # grid[i] stands for partitions for feature i
+    # grid[i][j] stands for partitions for feature i with k=j clusters
 
-        # Below, there are two layers of parallelism: 1) parallel execution
-        # across feature pairs and 2) the cdist_parts_parallel function, which
-        # also runs several threads to compare partitions using ari. In 2) we
-        # need to disable parallelization in case len(cm_values) > 1 (that is,
-        # we have several feature pairs to compare), because parallelization is
-        # already performed at this level. Otherwise, more threads than
-        # specified by the user are started.
-        cdist_parts_enable_threading = True if n_features_comp == 1 else False
+    threads_per_block = (32, 16, 16)
+    nx = n_features
+    ny = range_n_clusters.shape[0]
+    nz = n_objects
+    # equivalent to blocks_per_grid_x = math.ceil(nx / threads_per_block[0])
+    blocks_per_grid_x = (nx + threads_per_block[0] - 1) // threads_per_block[0]
+    blocks_per_grid_y = (ny + threads_per_block[1] - 1) // threads_per_block[1]
+    blocks_per_grid_z = (nz + threads_per_block[2] - 1) // threads_per_block[2]
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y, blocks_per_grid_z)
 
-        cdist_func = None
-        map_func = executor.map
-        if cdist_parts_enable_threading:
-            map_func = map
+    # Transfer data to device
+    h_X = X
+    d_X = cuda.to_device(h_X)
+    d_parts = cuda.to_device(parts)
 
-            def cdist_func(x, y):
-                return cdist_parts_parallel(x, y, executor)
+    # For this iteration, use CPU multi-threading to compute quantile lists using range_n_clusters
+    # Refer to https://docs.cupy.dev/en/stable/reference/generated/cupy.quantile.html for the GPU implementation
 
-        else:
-            cdist_func = cdist_parts_basic
+    # Call the compute_parts kernel, results are stored in d_parts Passing an array that resides in host memory will
+    # implicitly cause a copy back to the host, which will be synchronous.
+    # compute_parts[blocks_per_grid, threads_per_block](d_X, d_parts, range_n_clusters)
+    # # Wait for all previous kernels
+    # cuda.synchronize()
+    # print(parts)
 
-        # compute coefficients
-        def compute_coef(idx_list):
-            """
-            Given a list of indexes representing each a pair of
-            objects/rows/genes, it computes the CCC coefficient for
-            each of them. This function is supposed to be used to parallelize
-            processing.
+    # can also try compute_parts.forall()
+    an_array = np.zeros((n_features, n_objects), dtype=np.int16)
+    print(f"prev array: {an_array}")
+    threadsperblock = (16, 16)
+    blockspergrid_x = math.ceil(an_array.shape[0] / threadsperblock[0])
+    blockspergrid_y = math.ceil(an_array.shape[1] / threadsperblock[1])
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+    compute_parts2[blockspergrid, threadsperblock](an_array)
+    cuda.synchronize()
+    print(f"after array: {an_array}")
 
-            Args:
-                idx_list: a list of indexes (integers), each of them
-                  representing a pair of objects.
+    # compute coefficients
+    # def compute_coef(idx_list: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+    #     """
+    #     Given a list of indexes representing each a pair of
+    #     objects/rows/genes, it computes the CCC coefficient for
+    #     each of them. This function is supposed to be used to parallelize
+    #     processing.
+    #
+    #     Args:
+    #         idx_list: a list of indexes (integers), each of them
+    #           representing a pair of objects.
+    #
+    #     Returns:
+    #         Returns a tuple with two arrays. These two arrays are the same
+    #           arrays returned by the main cm function (cm_values and
+    #           max_parts) but for a subset of the data.
+    #     """
+    #     n_idxs = len(idx_list)
+    #     max_ari_list = np.full(n_idxs, np.nan, dtype=float)
+    #     max_part_idx_list = np.zeros((n_idxs, 2), dtype=np.uint64)
+    #
+    #     for idx, data_idx in enumerate(idx_list):
+    #         i, j = get_coords_from_index(n_features, data_idx)
+    #
+    #         # obji_parts and objj_parts are the partitions for the objects i and j.
+    #         obji_parts, objj_parts = parts[i], parts[j]
+    #
+    #         # compute ari only if partitions are not marked as "missing"
+    #         # (negative values), which is assigned when partitions have
+    #         # one cluster (usually when all data in the feature has the same
+    #         # value).
+    #         if obji_parts[0, 0] == -2 or objj_parts[0, 0] == -2:
+    #             continue
+    #
+    #         # compare all partitions of one object to the all the partitions
+    #         # of the other object, and get the maximium ARI
+    #         comp_values = cdist_func(
+    #             obji_parts,
+    #             objj_parts,
+    #         )
+    #         max_flat_idx = comp_values.argmax()
+    #
+    #         max_idx = unravel_index_2d(max_flat_idx, comp_values.shape)
+    #         max_part_idx_list[idx] = max_idx
+    #         max_ari_list[idx] = np.max((comp_values[max_idx], 0.0))
+    #
+    #     return max_ari_list, max_part_idx_list
 
-            Returns:
-                Returns a tuple with two arrays. These two arrays are the same
-                  arrays returned by the main cm function (cm_values and
-                  max_parts) but for a subset of the data.
-            """
-            n_idxs = len(idx_list)
-            max_ari_list = np.full(n_idxs, np.nan, dtype=float)
-            max_part_idx_list = np.zeros((n_idxs, 2), dtype=np.uint64)
 
-            for idx, data_idx in enumerate(idx_list):
-                i, j = get_coords_from_index(n_features, data_idx)
-
-                # get partitions for the pair of objects
-                obji_parts, objj_parts = parts[i], parts[j]
-
-                # compute ari only if partitions are not marked as "missing"
-                # (negative values), which is assigned when partitions have
-                # one cluster (usually when all data in the feature has the same
-                # value).
-                if obji_parts[0, 0] == -2 or objj_parts[0, 0] == -2:
-                    continue
-
-                # compare all partitions of one object to the all the partitions
-                # of the other object, and get the maximium ARI
-                comp_values = cdist_func(
-                    obji_parts,
-                    objj_parts,
-                )
-                max_flat_idx = comp_values.argmax()
-
-                max_idx = unravel_index_2d(max_flat_idx, comp_values.shape)
-                max_part_idx_list[idx] = max_idx
-                max_ari_list[idx] = np.max((comp_values[max_idx], 0.0))
-
-            return max_ari_list, max_part_idx_list
-
-        # iterate over all chunks of object pairs and compute the coefficient
-        inputs = get_chunks(n_features_comp, default_n_threads, n_chunks_threads_ratio)
-
-        for idx, (max_ari_list, max_part_idx_list) in zip(
-            inputs, map_func(compute_coef, inputs)
-        ):
-            cm_values[idx] = max_ari_list
-            max_parts[idx, :] = max_part_idx_list
-
-    # return an array of values or a single scalar, depending on the input data
-    if cm_values.shape[0] == 1:
-        if return_parts:
-            return cm_values[0], max_parts[0], parts
-        else:
-            return cm_values[0]
-
-    if return_parts:
-        return cm_values, max_parts, parts
-    else:
-        return cm_values
+# Dev notes
+# 1. parallelize get_parst
+# 1.1 gpu percentile computation
+# 1.1 gpu data points binning
+#   can be a kernel for-loop to compute parts on different percentile
