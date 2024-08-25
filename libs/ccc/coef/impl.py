@@ -549,6 +549,8 @@ def ccc(
             cm_values[idx] = max_ari_list
             max_parts[idx, :] = max_part_idx_list
 
+    print("CPU parts:")
+    print(parts)
     # return an array of values or a single scalar, depending on the input data
     if cm_values.shape[0] == 1:
         if return_parts:
